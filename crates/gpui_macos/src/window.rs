@@ -646,7 +646,9 @@ struct MacWindowState {
 impl MacWindowState {
     fn set_presents_with_transaction(&mut self, enabled: bool) {
         // Native geometry and both Metal planes must land in the same frame.
-        let enabled = enabled || self.overlay_renderer.is_some();
+        // Fork: embedded windows too, so host views behind the gpui view (Liquid Glass
+        // shapes it lays out) move in the same frame as gpui's content.
+        let enabled = enabled || self.overlay_renderer.is_some() || self.embed_observer.is_some();
         self.renderer.set_presents_with_transaction(enabled);
         if let Some(renderer) = self.overlay_renderer.as_mut() {
             renderer.set_presents_with_transaction(enabled);
@@ -3904,6 +3906,7 @@ impl MacWindow {
 
             let mut lock = window.0.lock();
             lock.embed_observer = Some(observer);
+            lock.set_presents_with_transaction(false); // forced on for embedded windows
             // The host window is usually already visible, so no occlusion change will start
             // the display link for us.
             lock.start_display_link();
