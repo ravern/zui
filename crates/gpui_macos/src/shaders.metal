@@ -1422,12 +1422,60 @@ vertex BackdropBlurVertexOutput backdrop_blur_vertex(
       {clip_distance.x, clip_distance.y, clip_distance.z, clip_distance.w}};
 }
 
+// Fork: Liquid Glass shading for backdrop blurs with `glass.variant != 0`.
+// The optics (rounded-rect SDF normals, edge lensing, light and dark rims, inner glow)
+// are ported from gpui-liquid-glass by 1234igor (MIT; its GPUI fork is Apache-2.0),
+// https://github.com/1234igor/gpui-liquid-glass — see THIRD-PARTY.md. Unlike the
+// original, the body is a neutral tint chosen by the caller (no hue fits), and the
+// blur is the region-limited MPS gaussian this renderer already runs.
+float4 shade_liquid_glass(BackdropBlur blur, float2 position, float4 source_rect,
+                          texture2d<float> blurred, texture2d<float> raw,
+                          sampler source_sampler) {
+  GlassShading glass = blur.glass;
+  bool clear = glass.variant == 2;
+  float scale = glass.scale;
+  float distance = quad_sdf(position, blur.bounds, blur.corner_radii);
+  float inside = -distance;
+  float bevel = (clear ? 16.0 : 15.0) * scale;
+  float edge = saturate(1.0 - inside / bevel);
+  float lens = smoothstep(0.0, 1.0, edge);
+  const float epsilon = 0.5;
+  float2 normal = normalize(float2(
+      quad_sdf(position + float2(epsilon, 0.0), blur.bounds, blur.corner_radii) -
+          quad_sdf(position - float2(epsilon, 0.0), blur.bounds, blur.corner_radii),
+      quad_sdf(position + float2(0.0, epsilon), blur.bounds, blur.corner_radii) -
+          quad_sdf(position - float2(0.0, epsilon), blur.bounds, blur.corner_radii)) +
+      float2(1e-6));
+  float2 sample_position = position - normal * (clear ? 26.0 : 3.2) * scale * lens;
+  float2 sample_uv = (sample_position - source_rect.xy) / source_rect.zw;
+  float3 color = clear ? raw.sample(source_sampler, sample_uv).rgb
+                       : blurred.sample(source_sampler, sample_uv).rgb;
+  if (!clear) {
+    float luma = dot(color, float3(0.2126, 0.7152, 0.0722));
+    color = luma + (color - luma) * 1.05;
+  }
+  float top_left_light = saturate((-normal.x - normal.y) * 0.5 + 0.5);
+  float bright_rim = clear ? pow(edge, 6.0) * (0.12 + 0.58 * top_left_light)
+                           : pow(edge, 5.0) * (0.06 + 0.18 * top_left_light);
+  float inner_glow = pow(edge, 1.7) * (clear ? 0.008 : 0.025);
+  float dark_rim = pow(edge, 4.0) * (1.0 - top_left_light) * (clear ? 0.13 : 0.04);
+  float4 tint = hsla_to_rgba(glass.tint);
+  color = mix(color, tint.rgb, saturate(tint.a + inner_glow + glass.interaction * 0.025));
+  color = mix(color, float3(1.0), bright_rim) * (1.0 - dark_rim);
+  color = mix(color, float3(1.0), glass.interaction * (0.055 + pow(edge, 2.2) * 0.12));
+  // Antialiased edge over what was there: blending is off on this pipeline.
+  float4 original = raw.sample(source_sampler, (position - source_rect.xy) / source_rect.zw);
+  float alpha = saturate(0.5 - distance);
+  return float4(mix(original.rgb, saturate(color), alpha), mix(original.a, 1.0, alpha));
+}
+
 fragment float4 backdrop_blur_fragment(
     BackdropBlurFragmentInput input [[stage_in]],
     constant BackdropBlur *blurs [[buffer(BackdropBlurInputIndex_Blurs)]],
     constant float4 &source_rect [[buffer(BackdropBlurInputIndex_SourceRect)]],
     texture2d<float> source_texture
-    [[texture(BackdropBlurInputIndex_SourceTexture)]]) {
+    [[texture(BackdropBlurInputIndex_SourceTexture)]],
+    texture2d<float> raw_texture [[texture(BackdropBlurInputIndex_RawTexture)]]) {
   constexpr sampler source_sampler(coord::normalized, address::clamp_to_edge,
                                    filter::linear);
   BackdropBlur blur = blurs[input.blur_id];
@@ -1435,6 +1483,13 @@ fragment float4 backdrop_blur_fragment(
   // Rounded-rect clip: blending is disabled on this pipeline (the blur
   // REPLACES the region), so fragments outside must discard, not return 0.
   float distance = quad_sdf(input.position.xy, blur.bounds, blur.corner_radii);
+  if (blur.glass.variant != 0) {
+    if (distance > 0.5) {
+      discard_fragment();
+    }
+    return shade_liquid_glass(blur, input.position.xy, source_rect, source_texture,
+                              raw_texture, source_sampler);
+  }
   if (distance > 0.) {
     discard_fragment();
   }

@@ -2,7 +2,7 @@
 use crate::Inspector;
 use crate::{
     Action, AnyDrag, AnyElement, AnyImageCache, AnyTooltip, AnyView, App, AppContext, Arena, Asset,
-    AsyncWindowContext, AvailableSpace, BackdropBlur, Background, BorderStyle, Bounds, BoxShadow,
+    AsyncWindowContext, AvailableSpace, BackdropBlur, Background, GlassShading, BorderStyle, Bounds, BoxShadow,
     Capslock, Context, Corners, CursorHideMode, CursorStyle, Decorations, DevicePixels,
     DispatchActionListener, DispatchNodeId, DispatchTree, DisplayId, Edges, Effect, Entity,
     EntityId, EventEmitter, FileDropEvent, FontId, Global, GlobalElementId, GlyphId, GpuSpecs,
@@ -4130,6 +4130,60 @@ impl Window {
         corner_radii: Corners<Pixels>,
         blur_radius: Pixels,
     ) {
+        self.insert_backdrop(bounds, corner_radii, blur_radius, GlassShading::default());
+    }
+
+    /// Fork: paint Liquid Glass (after Apple's material; technique ported from
+    /// gpui-liquid-glass, MIT, see THIRD-PARTY.md): the content beneath `bounds` is
+    /// blurred (`Regular`) or not (`Clear`), lensed at the rounded edge, lit with a rim
+    /// and given a soft drop shadow. The body is neutral: lighter in light appearances,
+    /// darker in dark ones, never a hue. `interaction` (0..1) brightens it for hover and
+    /// press. Paint the content that sits on the glass after this call. Metal renders the
+    /// full material; other renderers get the backdrop blur under a neutral tint.
+    pub fn paint_liquid_glass(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        corner_radii: Corners<Pixels>,
+        variant: LiquidGlassVariant,
+        interaction: f32,
+    ) {
+        let dark = matches!(self.appearance(), WindowAppearance::Dark | WindowAppearance::VibrantDark);
+        let tint = match (variant, dark) {
+            (LiquidGlassVariant::Clear, _) => crate::transparent_black(),
+            (LiquidGlassVariant::Regular, false) => crate::hsla(0., 0., 1., 0.5),
+            (LiquidGlassVariant::Regular, true) => crate::hsla(0., 0., 0.12, 0.5),
+        };
+        let shadow = BoxShadow {
+            color: crate::hsla(0., 0., 0., if dark { 0.3 } else { 0.12 }),
+            offset: crate::point(Pixels::ZERO, crate::px(1.)),
+            blur_radius: crate::px(10.),
+            spread_radius: Pixels::ZERO,
+            inset: false,
+        };
+        self.paint_drop_shadows(bounds, corner_radii, &[shadow]);
+        let glass = GlassShading {
+            variant: match variant {
+                LiquidGlassVariant::Regular => 1,
+                LiquidGlassVariant::Clear => 2,
+            },
+            interaction: interaction.clamp(0., 1.),
+            scale: self.scale_factor(),
+            tint,
+        };
+        // Glass blurs with σ = 8pt (the clear variant samples the unblurred snapshot).
+        self.insert_backdrop(bounds, corner_radii, crate::px(8.), glass);
+        // Renderers that ignore `glass` keep the plain blur: give it the body tint.
+        #[cfg(not(target_os = "macos"))]
+        self.paint_quad(crate::fill(bounds, tint).corner_radii(corner_radii));
+    }
+
+    fn insert_backdrop(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        corner_radii: Corners<Pixels>,
+        blur_radius: Pixels,
+        glass: GlassShading,
+    ) {
         self.invalidator.debug_assert_paint();
         let scale_factor = self.scale_factor();
         let content_mask = self.content_mask().scale(scale_factor);
@@ -4153,6 +4207,7 @@ impl Window {
             bounds: bounds.scale(scale_factor),
             content_mask,
             corner_radii: corner_radii.scale(scale_factor),
+            glass,
         });
     }
 
@@ -7263,4 +7318,13 @@ mod tests {
             .unwrap();
         assert_eq!(b_focus_count.get(), 1);
     }
+}
+
+/// Fork: the Liquid Glass variants of [`Window::paint_liquid_glass`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LiquidGlassVariant {
+    /// Frosted: the content beneath is blurred. For controls and text-heavy surfaces.
+    Regular,
+    /// Unblurred, only lensed at the edge: for controls over media.
+    Clear,
 }

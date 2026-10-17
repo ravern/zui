@@ -674,6 +674,25 @@ pub struct BackdropBlur {
     pub bounds: Bounds<ScaledPixels>,
     pub content_mask: ContentMask<ScaledPixels>,
     pub corner_radii: Corners<ScaledPixels>,
+    /// Fork: Liquid Glass shading on top of the blur (see
+    /// [`crate::Window::paint_liquid_glass`]); the default is a plain blur.
+    pub glass: GlassShading,
+}
+
+/// Fork: how a [`BackdropBlur`] is shaded as Liquid Glass. Metal renders it (edge
+/// lensing, rims); the other renderers keep the plain blur, and
+/// [`crate::Window::paint_liquid_glass`] adds a neutral tint over it there.
+#[derive(Debug, Copy, Clone, Default)]
+#[repr(C)]
+pub struct GlassShading {
+    /// 0: plain backdrop blur; 1: regular glass; 2: clear glass.
+    pub variant: u32,
+    /// 0..1: pressed / hovered emphasis.
+    pub interaction: f32,
+    /// The window's scale factor: the bevel, lens and rims are sized in points.
+    pub scale: f32,
+    /// Neutral body tint; its alpha is the strength.
+    pub tint: Hsla,
 }
 
 #[derive(Debug, Copy, Clone)]
@@ -1177,6 +1196,7 @@ mod tests {
     fn paint_blur(scene: &mut Scene) {
         scene.insert_primitive(shadow(crate::transparent_black()));
         scene.insert_backdrop_blur(BackdropBlur {
+            glass: Default::default(),
             order: 0,
             blur_radius: ScaledPixels(10.),
             bounds: bounds(),
@@ -1245,6 +1265,7 @@ mod tests {
         // shadow splitter. Quads on either side must remain separate batches.
         scene.insert_primitive(quad);
         scene.insert_backdrop_blur(BackdropBlur {
+            glass: Default::default(),
             order: 0,
             blur_radius: ScaledPixels(10.),
             bounds: bounds(),

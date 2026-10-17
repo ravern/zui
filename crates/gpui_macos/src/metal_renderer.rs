@@ -1011,7 +1011,9 @@ impl MetalRenderer {
                 // so snapshot just that padded region instead of the whole
                 // drawable (popovers are small; this is a 10-20x reduction).
                 let sigma = blur.blur_radius.0.max(1.0);
-                let padding = (sigma * 3.0).ceil() + 2.0;
+                // Fork: clear Liquid Glass lenses up to 26pt in from its edge.
+                let lens = if blur.glass.variant == 2 { 26.0 * blur.glass.scale } else { 0.0 };
+                let padding = (sigma * 3.0).ceil() + 2.0 + lens;
                 let visible = blur.bounds.intersect(&blur.content_mask.bounds);
                 let drawable_width = texture.width() as i64;
                 let drawable_height = texture.height() as i64;
@@ -1096,6 +1098,7 @@ impl MetalRenderer {
                     &mut instance_offset,
                     viewport_size,
                     &blurred,
+                    &scratch,
                     command_encoder,
                 ) {
                     command_encoder.end_encoding();
@@ -1515,6 +1518,7 @@ impl MetalRenderer {
         instance_offset: &mut usize,
         viewport_size: Size<DevicePixels>,
         source_texture: &metal::TextureRef,
+        raw_texture: &metal::TextureRef,
         command_encoder: &metal::RenderCommandEncoderRef,
     ) -> bool {
         if blurs.is_empty() {
@@ -1552,6 +1556,7 @@ impl MetalRenderer {
             BackdropBlurInputIndex::SourceTexture as u64,
             Some(source_texture),
         );
+        command_encoder.set_fragment_texture(BackdropBlurInputIndex::RawTexture as u64, Some(raw_texture));
 
         let blur_bytes_len = mem::size_of_val(blurs);
         let buffer_contents =
@@ -2305,6 +2310,8 @@ enum BackdropBlurInputIndex {
     /// Drawable rect the snapshot covers (x, y, w, h in device px) — the
     /// fragment shader maps frag position → snapshot UV through it.
     SourceRect = 4,
+    /// Fork: the unblurred snapshot, for Liquid Glass (clear variant, edge antialiasing).
+    RawTexture = 5,
 }
 
 #[repr(C)]
@@ -2467,6 +2474,7 @@ mod backdrop_blur_tests {
             pad: 0,
         });
         scene.insert_backdrop_blur(BackdropBlur {
+            glass: Default::default(),
             order: 0,
             blur_radius: ScaledPixels(radius),
             bounds: blur_bounds,
