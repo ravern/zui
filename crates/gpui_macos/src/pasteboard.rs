@@ -25,6 +25,16 @@ pub struct Pasteboard {
     metadata_type: id,
 }
 
+impl Drop for Pasteboard {
+    fn drop(&mut self) {
+        unsafe {
+            let _: () = msg_send![self.inner, release];
+            let _: () = msg_send![self.text_hash_type, release];
+            let _: () = msg_send![self.metadata_type, release];
+        }
+    }
+}
+
 impl Pasteboard {
     pub fn general() -> Self {
         unsafe { Self::new(NSPasteboard::generalPasteboard(nil)) }
@@ -39,11 +49,19 @@ impl Pasteboard {
         unsafe { Self::new(NSPasteboard::pasteboardWithUniqueName(nil)) }
     }
 
+    // Fork: everything kept here is retained (and released on drop). In embedded mode
+    // the platform is built inside the host's autorelease pool, which drains after the
+    // current event, so autoreleased objects stored here would dangle and the next
+    // clipboard read would crash.
+    #[allow(clippy::disallowed_methods)]
     unsafe fn new(inner: id) -> Self {
-        Self {
-            inner,
-            text_hash_type: unsafe { ns_string("zed-text-hash") },
-            metadata_type: unsafe { ns_string("zed-metadata") },
+        unsafe {
+            let inner: id = msg_send![inner, retain];
+            Self {
+                inner,
+                text_hash_type: NSString::alloc(nil).init_str("zed-text-hash"),
+                metadata_type: NSString::alloc(nil).init_str("zed-metadata"),
+            }
         }
     }
 
