@@ -4135,9 +4135,9 @@ impl Window {
 
     /// Fork: paint Liquid Glass (after Apple's material; technique ported from
     /// gpui-liquid-glass, MIT, see THIRD-PARTY.md): the content beneath `bounds` is
-    /// blurred (`Regular`) or not (`Clear`), lensed at the rounded edge, lit with a rim
-    /// and given a soft drop shadow. The body is neutral: lighter in light appearances,
-    /// darker in dark ones, never a hue. `interaction` (0..1) brightens it for hover and
+    /// blurred (`Regular`) or not (`Clear`), lensed at the rounded edge and outlined with
+    /// a hairline, matching native macOS 26 glass. The body is a neutral grey (fitted per
+    /// light / dark appearance), never a hue. `interaction` (0..1) brightens it for hover and
     /// press. Paint the content that sits on the glass after this call. Metal renders the
     /// full material; other renderers get the backdrop blur under a neutral tint.
     pub fn paint_liquid_glass(
@@ -4148,19 +4148,15 @@ impl Window {
         interaction: f32,
     ) {
         let dark = matches!(self.appearance(), WindowAppearance::Dark | WindowAppearance::VibrantDark);
+        // Fitted to native `.glassEffect(.regular)` (macOS 26) in a window: a flat neutral
+        // body (light grey over white, mid grey over dark content; 30% of what's beneath
+        // shows through) and a one-pixel darker hairline; no shadow at the edge.
         let tint = match (variant, dark) {
             (LiquidGlassVariant::Clear, _) => crate::transparent_black(),
-            (LiquidGlassVariant::Regular, false) => crate::hsla(0., 0., 1., 0.5),
-            (LiquidGlassVariant::Regular, true) => crate::hsla(0., 0., 0.12, 0.5),
+            (LiquidGlassVariant::Regular, false) => crate::hsla(0., 0., 0.925, 0.7),
+            (LiquidGlassVariant::Regular, true) => crate::hsla(0., 0., 0.23, 0.7),
         };
-        let shadow = BoxShadow {
-            color: crate::hsla(0., 0., 0., if dark { 0.3 } else { 0.12 }),
-            offset: crate::point(Pixels::ZERO, crate::px(1.)),
-            blur_radius: crate::px(10.),
-            spread_radius: Pixels::ZERO,
-            inset: false,
-        };
-        self.paint_drop_shadows(bounds, corner_radii, &[shadow]);
+        let rim = crate::hsla(0., 0., 0., if dark { 0.6 } else { 0.12 });
         let glass = GlassShading {
             variant: match variant {
                 LiquidGlassVariant::Regular => 1,
@@ -4169,6 +4165,7 @@ impl Window {
             interaction: interaction.clamp(0., 1.),
             scale: self.scale_factor(),
             tint,
+            rim,
         };
         // Glass blurs with σ = 8pt (the clear variant samples the unblurred snapshot).
         self.insert_backdrop(bounds, corner_radii, crate::px(8.), glass);

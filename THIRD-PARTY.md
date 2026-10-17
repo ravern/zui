@@ -5,7 +5,7 @@
 The Liquid Glass shading in `crates/gpui_macos/src/shaders.metal` (`shade_liquid_glass`)
 and the material parameters in `crates/gpui/src/window.rs` (`Window::paint_liquid_glass`)
 are ported from [gpui-liquid-glass](https://github.com/1234igor/gpui-liquid-glass) by
-1234igor: rounded-rect SDF normals, edge lensing, light and dark rims and the inner glow.
+1234igor: rounded-rect SDF normals and edge lensing.
 Its project code is under the MIT License:
 
 > MIT License

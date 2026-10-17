@@ -1423,11 +1423,12 @@ vertex BackdropBlurVertexOutput backdrop_blur_vertex(
 }
 
 // Fork: Liquid Glass shading for backdrop blurs with `glass.variant != 0`.
-// The optics (rounded-rect SDF normals, edge lensing, light and dark rims, inner glow)
-// are ported from gpui-liquid-glass by 1234igor (MIT; its GPUI fork is Apache-2.0),
+// The optics (rounded-rect SDF normals, edge lensing) are ported from
+// gpui-liquid-glass by 1234igor (MIT; its GPUI fork is Apache-2.0),
 // https://github.com/1234igor/gpui-liquid-glass — see THIRD-PARTY.md. Unlike the
-// original, the body is a neutral tint chosen by the caller (no hue fits), and the
-// blur is the region-limited MPS gaussian this renderer already runs.
+// original, the body is a flat neutral tint with a hairline, fitted to native macOS 26
+// glass in a window (no hue fits, no rim gradients), and the blur is the region-limited
+// MPS gaussian this renderer already runs.
 float4 shade_liquid_glass(BackdropBlur blur, float2 position, float4 source_rect,
                           texture2d<float> blurred, texture2d<float> raw,
                           sampler source_sampler) {
@@ -1454,14 +1455,13 @@ float4 shade_liquid_glass(BackdropBlur blur, float2 position, float4 source_rect
     float luma = dot(color, float3(0.2126, 0.7152, 0.0722));
     color = luma + (color - luma) * 1.05;
   }
-  float top_left_light = saturate((-normal.x - normal.y) * 0.5 + 0.5);
-  float bright_rim = clear ? pow(edge, 6.0) * (0.12 + 0.58 * top_left_light)
-                           : pow(edge, 5.0) * (0.06 + 0.18 * top_left_light);
-  float inner_glow = pow(edge, 1.7) * (clear ? 0.008 : 0.025);
-  float dark_rim = pow(edge, 4.0) * (1.0 - top_left_light) * (clear ? 0.13 : 0.04);
+  // Flat neutral body (native glass in a window has no visible rim gradient), a
+  // one-device-pixel hairline at the edge, and the hover / press glow.
   float4 tint = hsla_to_rgba(glass.tint);
-  color = mix(color, tint.rgb, saturate(tint.a + inner_glow + glass.interaction * 0.025));
-  color = mix(color, float3(1.0), bright_rim) * (1.0 - dark_rim);
+  color = mix(color, tint.rgb, saturate(tint.a + glass.interaction * 0.025));
+  float4 rim = hsla_to_rgba(glass.rim);
+  // Full strength over the outermost device pixel (pixel centres sit at inside ≈ 0.5).
+  color = mix(color, rim.rgb, rim.a * saturate(1.5 - inside));
   color = mix(color, float3(1.0), glass.interaction * (0.055 + pow(edge, 2.2) * 0.12));
   // Antialiased edge over what was there: blending is off on this pipeline.
   float4 original = raw.sample(source_sampler, (position - source_rect.xy) / source_rect.zw);

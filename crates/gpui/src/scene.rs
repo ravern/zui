@@ -693,6 +693,8 @@ pub struct GlassShading {
     pub scale: f32,
     /// Neutral body tint; its alpha is the strength.
     pub tint: Hsla,
+    /// The hairline drawn along the edge (one device pixel), as native glass has.
+    pub rim: Hsla,
 }
 
 #[derive(Debug, Copy, Clone)]
