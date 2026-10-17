@@ -174,6 +174,8 @@ pub(crate) struct MacPlatformState {
     text_system: Arc<dyn PlatformTextSystem>,
     renderer_context: renderer::Context,
     headless: bool,
+    /// Fork: the host process owns NSApp and its run loop (see `MacPlatform::new_embedded`).
+    embedded: bool,
     general_pasteboard: Pasteboard,
     find_pasteboard: Pasteboard,
     reopen: Option<Box<dyn FnMut()>>,
@@ -218,6 +220,7 @@ impl MacPlatform {
 
         Self(Mutex::new(MacPlatformState {
             headless,
+            embedded: false,
             text_system,
             background_executor: BackgroundExecutor::new(dispatcher.clone()),
             foreground_executor: ForegroundExecutor::new(dispatcher),
@@ -493,6 +496,13 @@ impl Platform for MacPlatform {
 
     fn run(&self, on_finish_launching: Box<dyn FnOnce()>) {
         let mut state = self.0.lock();
+        if state.embedded {
+            state.finish_launching = Some(on_finish_launching);
+            drop(state);
+            // SAFETY: called on the main thread by `Application::run_embedded`.
+            unsafe { self.run_embedded() };
+            return;
+        }
         if state.headless {
             drop(state);
             on_finish_launching();
@@ -1562,4 +1572,38 @@ mod security {
     pub const errSecSuccess: OSStatus = 0;
     pub const errSecUserCanceled: OSStatus = -128;
     pub const errSecItemNotFound: OSStatus = -25300;
+}
+
+// ---- Fork: embedded mode -------------------------------------------------------------
+//
+// A host application (e.g. a Swift shell) owns `NSApplication`, its delegate, the main
+// menu and `[NSApp run]`. GPUI only needs the platform services that don't depend on owning
+// NSApp. The dispatcher already targets the main dispatch queue, which the host's run loop
+// drains, so the foreground executor keeps working unchanged.
+//
+// Use with `gpui::Application::run_embedded` and open windows with
+// `gpui_macos::open_window_in_view`.
+
+impl MacPlatform {
+    /// A platform for embedding GPUI in an app whose host already created `NSApp`
+    /// (call `NSApplication.shared` before this) and runs the main run loop.
+    pub fn new_embedded() -> Self {
+        let platform = Self::new(false);
+        platform.0.lock().embedded = true;
+        platform
+    }
+
+    /// Embedded counterpart of `run`: performs the launch work of the app delegate without
+    /// installing it as NSApp's delegate, then returns without entering the run loop.
+    unsafe fn run_embedded(&self) {
+        unsafe {
+            // Not installed as NSApp's delegate; it only observes notifications (keyboard
+            // layout, thermal state, wake) and carries the platform pointer. Leaked: it lives
+            // as long as the process.
+            let observer: id = msg_send![APP_DELEGATE_CLASS, new];
+            (*observer).set_ivar(MAC_PLATFORM_IVAR, self as *const Self as *const c_void);
+            will_finish_launching(&mut *observer, sel!(applicationWillFinishLaunching:), nil);
+            did_finish_launching(&mut *observer, sel!(applicationDidFinishLaunching:), nil);
+        }
+    }
 }

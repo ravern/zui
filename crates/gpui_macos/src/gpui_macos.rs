@@ -135,3 +135,6 @@ unsafe impl objc::Encode for NSRange {
 unsafe fn ns_string(string: &str) -> id {
     unsafe { NSString::alloc(nil).init_str(string).autorelease() }
 }
+
+// Fork: embedded mode (host-owned NSApp / NSWindow). See the end of window.rs.
+pub use window::open_window_in_view;

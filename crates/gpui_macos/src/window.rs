@@ -319,6 +319,29 @@ unsafe fn build_classes() {
                 sel!(characterIndexForPoint:),
                 character_index_for_point as extern "C" fn(&Object, Sel, NSPoint) -> u64,
             );
+
+            // Fork: embedded views register for drags themselves since the host window
+            // isn't a GPUIWindow. Unregistered (non-embedded) views never receive these.
+            decl.add_method(
+                sel!(draggingEntered:),
+                dragging_entered as extern "C" fn(&Object, Sel, id) -> NSDragOperation,
+            );
+            decl.add_method(
+                sel!(draggingUpdated:),
+                dragging_updated as extern "C" fn(&Object, Sel, id) -> NSDragOperation,
+            );
+            decl.add_method(
+                sel!(draggingExited:),
+                dragging_exited as extern "C" fn(&Object, Sel, id),
+            );
+            decl.add_method(
+                sel!(performDragOperation:),
+                perform_drag_operation as extern "C" fn(&Object, Sel, id) -> BOOL,
+            );
+            decl.add_method(
+                sel!(concludeDragOperation:),
+                conclude_drag_operation as extern "C" fn(&Object, Sel, id),
+            );
             decl.register()
         };
         OVERLAY_VIEW_CLASS = {
@@ -421,19 +444,11 @@ pub(crate) unsafe fn set_active_window_cursor_style(style: CursorStyle) {
         let app = NSApplication::sharedApplication(nil);
         let key_window: id = msg_send![app, keyWindow];
         let main_window: id = msg_send![app, mainWindow];
-        let active_window = if !key_window.is_null() && is_gpui_window(key_window) {
-            Some(key_window)
-        } else if !main_window.is_null() && is_gpui_window(main_window) {
-            Some(main_window)
-        } else {
-            None
-        };
-
-        let Some(active_window) = active_window else {
+        // Fork: `any_window_state` also finds host windows with embedded GPUI views.
+        let Some(window_state) = any_window_state(key_window).or_else(|| any_window_state(main_window))
+        else {
             return;
         };
-
-        let window_state = get_window_state(&*active_window);
         let mut window_state = window_state.lock();
         if window_state.cursor_style != style {
             window_state.cursor_style = style;
@@ -624,6 +639,8 @@ struct MacWindowState {
     accesskit_adapter: Option<accesskit_macos::SubclassingAdapter>,
     // The parent window if this window is a sheet (Dialog kind)
     sheet_parent: Option<id>,
+    // Fork: set when GPUI is embedded in a host-owned NSWindow (see `open_embedded`).
+    embed_observer: Option<id>,
 }
 
 impl MacWindowState {
@@ -875,6 +892,20 @@ impl MacWindow {
         background_executor: BackgroundExecutor,
         renderer_context: renderer::Context,
     ) -> Self {
+        // Fork: open into a host-provided NSView instead (see the end of this file).
+        if let Some(host_view) = take_embed_host_view() {
+            return unsafe {
+                Self::open_embedded(
+                    host_view,
+                    handle,
+                    app_owns_titlebar_drag,
+                    cursor_visible,
+                    foreground_executor,
+                    background_executor,
+                    renderer_context,
+                )
+            };
+        }
         unsafe {
             let pool = NSAutoreleasePool::new(nil);
 
@@ -1041,6 +1072,7 @@ impl MacWindow {
                 closed: Arc::new(AtomicBool::new(false)),
                 accesskit_adapter: None,
                 sheet_parent: None,
+                embed_observer: None,
             })));
 
             (*native_window).set_ivar(
@@ -1221,7 +1253,8 @@ impl MacWindow {
                 let handle = get_window_state(&*main_window).lock().handle;
                 Some(handle)
             } else {
-                None
+                // Fork: host window with an embedded GPUI view.
+                embedded_window_state(main_window).map(|state| state.lock().handle)
             }
         }
     }
@@ -1238,6 +1271,9 @@ impl MacWindow {
                 if msg_send![window, isKindOfClass: WINDOW_CLASS] {
                     let handle = get_window_state(&*window).lock().handle;
                     window_handles.push(handle);
+                } else if let Some(state) = embedded_window_state(window) {
+                    // Fork: host window with an embedded GPUI view.
+                    window_handles.push(state.lock().handle);
                 }
             }
 
@@ -1257,8 +1293,9 @@ impl MacWindow {
             let mut windows = Vec::new();
             for i in 0..count {
                 let window: id = msg_send![native_windows, objectAtIndex: i];
-                if is_gpui_window(window) {
-                    windows.push(get_window_state(&*window));
+                // Fork: `any_window_state` also covers embedded GPUI views.
+                if let Some(state) = any_window_state(window) {
+                    windows.push(state);
                 }
             }
             windows
@@ -1312,6 +1349,11 @@ impl Drop for MacWindow {
         let window = this.native_window;
         let sheet_parent = this.sheet_parent.take();
         this.frame_source.take();
+        // Fork: the host owns the NSWindow; detach from it instead of closing it.
+        if let Some(observer) = this.embed_observer.take() {
+            detach_embedded(&mut this, observer);
+            return;
+        }
         unsafe {
             this.native_window.setDelegate_(nil);
         }
@@ -1667,6 +1709,10 @@ impl PlatformWindow for MacWindow {
 
         let opaque = background_appearance == WindowBackgroundAppearance::Opaque;
         this.renderer.update_transparency(!opaque);
+        // Fork: the host owns the NSWindow's opacity, background and vibrancy.
+        if this.embed_observer.is_some() {
+            return;
+        }
 
         unsafe {
             this.native_window.setOpaque_(opaque as BOOL);
@@ -2202,11 +2248,20 @@ impl PlatformWindow for MacWindow {
         let action_handler = A11yActionHandler(callbacks.action);
 
         let adapter = unsafe {
-            accesskit_macos::SubclassingAdapter::for_window(
-                lock.native_window as *mut c_void,
-                activation_handler,
-                action_handler,
-            )
+            // Fork: don't subclass a host-owned content view; use our own view instead.
+            if lock.embed_observer.is_some() {
+                accesskit_macos::SubclassingAdapter::new(
+                    lock.native_view.as_ptr() as *mut c_void,
+                    activation_handler,
+                    action_handler,
+                )
+            } else {
+                accesskit_macos::SubclassingAdapter::for_window(
+                    lock.native_window as *mut c_void,
+                    activation_handler,
+                    action_handler,
+                )
+            }
         };
 
         lock.accesskit_adapter = Some(adapter);
@@ -3594,6 +3649,282 @@ extern "C" fn toggle_tab_bar(this: &Object, _sel: Sel, _id: id) {
             window_state.lock().toggle_tab_bar_callback = Some(callback);
         }
     }
+}
+
+// ---- Fork: embedded mode -------------------------------------------------------------
+//
+// Lets a host application that owns the NSWindow (e.g. a Swift shell) show a GPUI window
+// inside one of its views. GPUI attaches its Metal-backed `GPUIView` as an autoresizing
+// subview filling the host view and makes it first responder; all input, IME, cursor, scale
+// and appearance handling stays on that view exactly as for GPUI-owned windows. What GPUI
+// normally gets from being the NSWindow's class and delegate (key status, occlusion, screen
+// and move changes) comes from NSNotificationCenter instead, through an observer object
+// carrying the same window-state ivar, so the existing delegate functions are reused.
+//
+// The host owns the window's style, titlebar, background/vibrancy, menus, and lifetime:
+// GPUI never orders, closes or restyles it. Dropping the GPUI window just detaches the view.
+//
+// Constraint: the host view must fill the window's content area (a full-size content view),
+// because GPUI's event and IME coordinates are window-relative.
+
+static mut EMBED_OBSERVER_CLASS: *const Class = ptr::null();
+// Address used as the associated-object key mapping a host NSWindow to its observer.
+static EMBED_OBSERVER_KEY: u8 = 0;
+const OBJC_ASSOCIATION_ASSIGN: usize = 0;
+
+unsafe extern "C" {
+    fn objc_setAssociatedObject(object: id, key: *const c_void, value: id, policy: usize);
+    fn objc_getAssociatedObject(object: id, key: *const c_void) -> id;
+}
+
+thread_local! {
+    static EMBED_HOST_VIEW: Cell<id> = const { Cell::new(ptr::null_mut()) };
+}
+
+/// Runs `open`, during which the next `App::open_window` call attaches the new window to
+/// `host_view` (an `NSView*` already in an `NSWindow`) instead of creating an NSWindow.
+/// Only the window-related `WindowOptions` that make sense inside a host apply
+/// (`app_owns_titlebar_drag`, `window_background` transparency); bounds, titlebar, kind,
+/// focus and show are the host's business.
+pub fn open_window_in_view<R>(host_view: *mut c_void, open: impl FnOnce() -> R) -> R {
+    let previous = EMBED_HOST_VIEW.replace(host_view as id);
+    let result = open();
+    EMBED_HOST_VIEW.set(previous);
+    result
+}
+
+fn take_embed_host_view() -> Option<id> {
+    let view = EMBED_HOST_VIEW.replace(ptr::null_mut());
+    (!view.is_null()).then_some(view)
+}
+
+#[ctor(unsafe)]
+unsafe fn build_embed_observer_class() {
+    unsafe {
+        let mut decl = ClassDecl::new("GPUIEmbedObserver", class!(NSObject)).unwrap();
+        decl.add_ivar::<*mut c_void>(WINDOW_STATE_IVAR);
+        decl.add_method(
+            sel!(dealloc),
+            dealloc_embed_observer as extern "C" fn(&Object, Sel),
+        );
+        // Same selectors as the GPUIWindow delegate methods, which these functions inspect.
+        decl.add_method(
+            sel!(windowDidBecomeKey:),
+            window_did_change_key_status as extern "C" fn(&Object, Sel, id),
+        );
+        decl.add_method(
+            sel!(windowDidResignKey:),
+            window_did_change_key_status as extern "C" fn(&Object, Sel, id),
+        );
+        decl.add_method(
+            sel!(windowDidChangeOcclusionState:),
+            window_did_change_occlusion_state as extern "C" fn(&Object, Sel, id),
+        );
+        decl.add_method(
+            sel!(windowDidChangeScreen:),
+            window_did_change_screen as extern "C" fn(&Object, Sel, id),
+        );
+        decl.add_method(
+            sel!(windowDidMove:),
+            window_did_move as extern "C" fn(&Object, Sel, id),
+        );
+        EMBED_OBSERVER_CLASS = decl.register();
+    }
+}
+
+const EMBED_NOTIFICATIONS: [(&str, &str); 5] = [
+    ("windowDidBecomeKey:", "NSWindowDidBecomeKeyNotification"),
+    ("windowDidResignKey:", "NSWindowDidResignKeyNotification"),
+    (
+        "windowDidChangeOcclusionState:",
+        "NSWindowDidChangeOcclusionStateNotification",
+    ),
+    ("windowDidChangeScreen:", "NSWindowDidChangeScreenNotification"),
+    ("windowDidMove:", "NSWindowDidMoveNotification"),
+];
+
+extern "C" fn dealloc_embed_observer(this: &Object, _: Sel) {
+    unsafe {
+        drop_window_state(this);
+        let _: () = msg_send![super(this, class!(NSObject)), dealloc];
+    }
+}
+
+/// The state of the GPUI view embedded in `window`, if `window` is a host window.
+unsafe fn embedded_window_state(window: id) -> Option<Arc<Mutex<MacWindowState>>> {
+    unsafe {
+        let key = &EMBED_OBSERVER_KEY as *const u8 as *const c_void;
+        let observer = objc_getAssociatedObject(window, key);
+        (!observer.is_null()).then(|| get_window_state(&*observer))
+    }
+}
+
+/// The state for a GPUI-owned window or a host window with an embedded GPUI view.
+unsafe fn any_window_state(window: id) -> Option<Arc<Mutex<MacWindowState>>> {
+    unsafe {
+        if window.is_null() {
+            None
+        } else if is_gpui_window(window) {
+            Some(get_window_state(&*window))
+        } else {
+            embedded_window_state(window)
+        }
+    }
+}
+
+impl MacWindow {
+    unsafe fn open_embedded(
+        host_view: id,
+        handle: AnyWindowHandle,
+        app_owns_titlebar_drag: bool,
+        cursor_visible: Arc<AtomicBool>,
+        foreground_executor: ForegroundExecutor,
+        background_executor: BackgroundExecutor,
+        renderer_context: renderer::Context,
+    ) -> Self {
+        unsafe {
+            let native_window: id = msg_send![host_view, window];
+            assert!(
+                !native_window.is_null(),
+                "embedded GPUI host view must be in a window"
+            );
+            assert!(
+                embedded_window_state(native_window).is_none(),
+                "host window already has an embedded GPUI view"
+            );
+            // Released in `detach_embedded`, once our view is gone.
+            let _: id = msg_send![native_window, retain];
+
+            let frame = NSView::bounds(host_view);
+            let native_view: id = msg_send![VIEW_CLASS, alloc];
+            let native_view = NSView::initWithFrame_(native_view, frame);
+            assert!(!native_view.is_null());
+
+            let window = Self(Arc::new(Mutex::new(MacWindowState {
+                handle,
+                foreground_executor,
+                background_executor,
+                native_window,
+                native_view: NonNull::new_unchecked(native_view),
+                blurred_view: None,
+                background_appearance: WindowBackgroundAppearance::Opaque,
+                cursor_style: CursorStyle::Arrow,
+                cursor_visible,
+                frame_source: None,
+                frame_requested: Arc::new(AtomicBool::new(true)),
+                renderer: renderer::new_renderer(
+                    renderer_context,
+                    native_window as *mut _,
+                    native_view as *mut _,
+                    size(frame.size.width as f32, frame.size.height as f32),
+                    false,
+                ),
+                overlay_renderer: None,
+                overlay_view: None,
+                overlay_backdrops: Vec::new(),
+                overlay_capture_input: Arc::new(AtomicBool::new(false)),
+                overlay_size: None,
+                request_frame_callback: None,
+                event_callback: None,
+                activate_callback: None,
+                resize_callback: None,
+                moved_callback: None,
+                should_close_callback: None,
+                close_callback: None,
+                appearance_changed_callback: None,
+                input_handler: None,
+                last_key_equivalent: None,
+                synthetic_drag_counter: 0,
+                traffic_light_position: None,
+                traffic_light_frames: None,
+                transparent_titlebar: false,
+                previous_modifiers_changed_event: None,
+                keystroke_for_do_command: None,
+                do_command_handled: None,
+                external_files_dragged: false,
+                first_mouse: false,
+                app_owns_titlebar_drag,
+                fullscreen_restore_bounds: Bounds::default(),
+                move_tab_to_new_window_callback: None,
+                merge_all_windows_callback: None,
+                select_next_tab_callback: None,
+                select_previous_tab_callback: None,
+                toggle_tab_bar_callback: None,
+                activated_least_once: false,
+                closed: Arc::new(AtomicBool::new(false)),
+                accesskit_adapter: None,
+                sheet_parent: None,
+                embed_observer: None,
+            })));
+
+            (*native_view).set_ivar(
+                WINDOW_STATE_IVAR,
+                Arc::into_raw(window.0.clone()) as *const c_void,
+            );
+            let observer: id = msg_send![EMBED_OBSERVER_CLASS, new];
+            (*observer).set_ivar(
+                WINDOW_STATE_IVAR,
+                Arc::into_raw(window.0.clone()) as *const c_void,
+            );
+            let center: id = msg_send![class!(NSNotificationCenter), defaultCenter];
+            for (selector, name) in EMBED_NOTIFICATIONS {
+                let _: () = msg_send![center,
+                    addObserver: observer
+                    selector: Sel::register(selector)
+                    name: ns_string(name)
+                    object: native_window
+                ];
+            }
+            let key = &EMBED_OBSERVER_KEY as *const u8 as *const c_void;
+            objc_setAssociatedObject(native_window, key, observer, OBJC_ASSOCIATION_ASSIGN);
+
+            native_view.setAutoresizingMask_(NSViewWidthSizable | NSViewHeightSizable);
+            native_view.setWantsBestResolutionOpenGLSurface_(YES);
+            native_view.setWantsLayer(YES);
+            let _: () = msg_send![
+                native_view,
+                setLayerContentsRedrawPolicy: NSViewLayerContentsRedrawDuringViewResize
+            ];
+            let _: () = msg_send![
+                native_view,
+                registerForDraggedTypes: NSArray::arrayWithObject(nil, NSFilenamesPboardType)
+            ];
+            host_view.addSubview_(native_view.autorelease());
+            native_window.setAcceptsMouseMovedEvents_(YES);
+            native_window.makeFirstResponder_(native_view);
+
+            let mut lock = window.0.lock();
+            lock.embed_observer = Some(observer);
+            // The host window is usually already visible, so no occlusion change will start
+            // the display link for us.
+            lock.start_display_link();
+            drop(lock);
+            window
+        }
+    }
+}
+
+fn detach_embedded(state: &mut MacWindowState, observer: id) {
+    state.closed.store(true, Ordering::Release);
+    let window = state.native_window;
+    let view = state.native_view.as_ptr();
+    unsafe {
+        let center: id = msg_send![class!(NSNotificationCenter), defaultCenter];
+        let _: () = msg_send![center, removeObserver: observer];
+        let key = &EMBED_OBSERVER_KEY as *const u8 as *const c_void;
+        objc_setAssociatedObject(window, key, nil, OBJC_ASSOCIATION_ASSIGN);
+        let _: () = msg_send![observer, release];
+    }
+    // Deferred like `close` in `Drop`: we may be running inside one of the view's handlers.
+    state
+        .foreground_executor
+        .spawn(async move {
+            unsafe {
+                let _: () = msg_send![view, removeFromSuperview];
+                let _: () = msg_send![window, release];
+            }
+        })
+        .detach();
 }
 
 #[cfg(test)]
