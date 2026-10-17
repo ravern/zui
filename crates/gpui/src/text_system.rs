@@ -58,6 +58,16 @@ pub struct TextSystem {
     fallback_font_stack: SmallVec<[Font; 2]>,
 }
 
+static FONT_SMOOTHING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// Whether glyphs get the platform's font smoothing (on macOS, CoreGraphics' stroke
+/// dilation, which thickens text more the lighter it is). On by default; off gives the
+/// thinner text of `-webkit-font-smoothing: antialiased`. Glyphs are cached per
+/// dilation, so refresh windows after changing it.
+pub fn set_font_smoothing(enabled: bool) {
+    FONT_SMOOTHING.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
 impl TextSystem {
     /// Create a new TextSystem with the given platform text system.
     pub fn new(platform_text_system: Arc<dyn PlatformTextSystem>) -> Self {
@@ -344,6 +354,9 @@ impl TextSystem {
 
     /// Returns the dilation level to use for a glyph painted in the given color.
     pub(crate) fn glyph_dilation_for_color(&self, color: Hsla) -> u8 {
+        if !FONT_SMOOTHING.load(std::sync::atomic::Ordering::Relaxed) {
+            return 0;
+        }
         self.platform_text_system.glyph_dilation_for_color(color)
     }
 
